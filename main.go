@@ -16,37 +16,35 @@ var (
 	totalRecords = 10000
 )
 
-const(
-	minUpdatePct = 0.1
-	maxUpdatePct = 0.4
-)
+type config struct {
+	seed          int64
+	dbURL        string
+	tableName    string
+	schemaName  string
+	scale         int
+	planCacheMode string
+	minUpdatePct float64
+	maxUpdatePct float64
+}
 
 func main() {
-	seed := flag.Int64("seed", 20672067, "Random seed for reproducibility")
-	dbURL := flag.String("db", "", "PostgreSQL connection URL")
-	tableName := flag.String("table", "metrics", "Table name to use for the benchmark")
-	scale := flag.Int("scale", 1, "Scale factor for the number of records (default is 1x, 10000 records)")
-	planCacheMode := flag.String("plan_cache_mode", "force_generic_plan", "Plan cache mode to use for the connection")
+	var cfg config
+	flag.Int64Var(&cfg.seed, "seed", 20672067, "Random seed for reproducibility")
+	flag.StringVar(&cfg.dbURL, "db", "", "PostgreSQL connection URL")
+	flag.StringVar(&cfg.schemaName, "schema", "public", "Schema name to use for the benchmark")
+	flag.StringVar(&cfg.tableName, "table", "metrics", "Table name to use for the benchmark")
+	flag.IntVar(&cfg.scale, "scale", 1, "Scale factor for the number of records (default is 1x, 10000 records)")
+	flag.StringVar(&cfg.planCacheMode, "plan_cache_mode", "force_generic_plan", "Plan cache mode to use for the connection")
+	flag.Float64Var(&cfg.minUpdatePct, "min_update_pct", 0.1, "Minimum percentage of updates in the batch (default is 0.1)")
+	flag.Float64Var(&cfg.maxUpdatePct, "max_update_pct", 0.3, "Maximum percentage of updates in the batch (default is 0.3)")
 
 	flag.Parse()
-	rand.Seed(*seed)
 
-	if *dbURL == "" {
-		fmt.Println("DATABASE_URL is required")
-		os.Exit(1)
-	}
-	if *tableName == "" {
-		fmt.Println("Table name is required")
-		os.Exit(1)
-	}
-
-	totalRecords = *scale * totalRecords
-
-	fmt.Println("Seed:", *seed, "table:", *tableName, "scale:", *scale)
+	fmt.Println("Seed:", cfg.seed, "table:", cfg.tableName, "scale:", cfg.scale)
 
 	ctx := context.Background()
 	// set application name for the connection
-	config, err := pgx.ParseConfig(*dbURL)
+	config, err := pgx.ParseConfig(cfg.dbURL)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to parse database URL: %v", err))
 	}
@@ -57,9 +55,9 @@ func main() {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to connect: %v", err))
 	}
-	defer conn.Close(ctx)
+	defer conn.Close(ctx) //
 
-	createTable(ctx, conn, *tableName)
+	createTable(ctx, conn, cfg)
 
 	ticker := time.NewTicker(2 * time.Second)
 	defer ticker.Stop()
@@ -77,7 +75,7 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			executeBatch(ctx, conn, *tableName, *planCacheMode)
+			executeBatch(ctx, conn, cfg)
 		case <-ctx.Done():
 			fmt.Println("Exiting due to context cancellation")
 			return
@@ -85,23 +83,33 @@ func main() {
 	}
 }
 
-func createTable(ctx context.Context, conn *pgx.Conn, tableName string) {
-	ddl := fmt.Sprintf(`CREATE TABLE IF NOT EXISTS %s (
-		id integer,
-		time timestamptz,
-		name text,
-		value numeric,
-		seq_id bigint PRIMARY KEY DEFAULT nextval('metrics1_seq_id_seq')
-	);`, pgx.Identifier{tableName}.Sanitize())
+func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
+	ddl := fmt.Sprintf(`
+		CREATE TABLE IF NOT EXISTS %s (
+			id integer,
+			time timestamptz,
+			name text,
+			value numeric,
+			seq_id bigserial,
+			PRIMARY KEY (time, seq_id)
+		);
+		CREATE INDEX IF NOT EXISTS %[2]s ON %[1]s USING btree(time);`,
+		pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize(),
+		pgx.Identifier{cfg.tableName + "_time_idx"}.Sanitize(),
+	)
 
+	fmt.Println("Creating table with DDL:", ddl)
 	_, err := conn.Exec(ctx, ddl)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create table: %v", err))
 	}
 }
 
-func executeBatch(ctx context.Context, conn *pgx.Conn, tableName string, plan string) {
-	updatePct := minUpdatePct + rand.Float64()*(maxUpdatePct-minUpdatePct)
+func executeBatch(ctx context.Context, conn *pgx.Conn, cfg config) {
+
+	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
+
+	totalRecords := cfg.scale * totalRecords
 
 	numUpdates := int(float64(totalRecords) * updatePct)
 	numInserts := totalRecords - numUpdates
@@ -109,18 +117,25 @@ func executeBatch(ctx context.Context, conn *pgx.Conn, tableName string, plan st
 	totalOps := numInserts + numUpdates
 	batch := &pgx.Batch{}
 
-	insertSQL := fmt.Sprintf("INSERT INTO %s (id, time, name, value) VALUES ($1, $2, $3, $4)", pgx.Identifier{tableName}.Sanitize())
-	updateSQL := fmt.Sprintf("UPDATE %[1]s SET value = $1 WHERE time=$2 AND seq_id=$3", pgx.Identifier{tableName}.Sanitize())
+	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
+	insertSQL := fmt.Sprintf("INSERT INTO %s (id, time, name, value) VALUES ($1, $2, $3, $4)", relName)
+	updateSQL := fmt.Sprintf("UPDATE %[1]s SET value = $1 WHERE time=$2 AND seq_id=$3", relName)
 
 	// Get max seq_id to use for updates
 	var maxSeqID int64
 	var maxtTime time.Time
 
-	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time desc LIMIT 1", pgx.Identifier{tableName}.Sanitize())
+	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time desc LIMIT 1", relName)
 	err := conn.QueryRow(ctx, maxQuery).Scan(&maxSeqID, &maxtTime)
+	if err != nil {
+		fmt.Printf("Failed to get max seq_id: %v\n", err)
+		return
+	}
+
+	fmt.Printf("Max seq_id: %d, Max time: %s\n", maxSeqID, maxtTime.Format(time.RFC3339))
 
 	batch.Queue(
-		fmt.Sprintf("SET plan_cache_mode = '%s'", plan),
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
 	)
 
 	for i := 0; i < numInserts; i++ {
