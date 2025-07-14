@@ -26,6 +26,11 @@ type config struct {
 	planCacheMode string
 	minUpdatePct float64
 	maxUpdatePct float64
+	mode          string
+}
+
+type executor interface {
+	execute(ctx context.Context, conn *pgx.Conn)
 }
 
 func main() {
@@ -38,6 +43,7 @@ func main() {
 	flag.StringVar(&cfg.planCacheMode, "plan_cache_mode", "force_generic_plan", "Plan cache mode to use for the connection")
 	flag.Float64Var(&cfg.minUpdatePct, "min_update_pct", 0.1, "Minimum percentage of updates in the batch (default is 0.1)")
 	flag.Float64Var(&cfg.maxUpdatePct, "max_update_pct", 0.3, "Maximum percentage of updates in the batch (default is 0.3)")
+	flag.StringVar(&cfg.mode, "mode", "multi_value", "Execution mode: 'multi_value' or 'simple_pgx_batch'")
 
 	flag.Parse()
 
@@ -74,11 +80,20 @@ func main() {
 		fmt.Println("Shutting down...")
 	}()
 
+	var exec executor
+	switch cfg.mode {
+	case "multi_value":
+		exec = multiValueExecutor{cfg: cfg}
+	case "simple_pgx_batch":
+		exec = simplePgxBatchExecutor{cfg: cfg}
+	default:
+		panic(fmt.Sprintf("Unknown mode: %s", cfg.mode))
+	}
+
 	for {
 		select {
 		case <-ticker.C:
-			// executeBatch(ctx, conn, cfg)
-			executeMultiValue(ctx, conn, cfg)
+			exec.execute(ctx, conn)
 		case <-ctx.Done():
 			fmt.Println("Exiting due to context cancellation")
 			return
@@ -108,7 +123,12 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 	}
 }
 
-func executeMultiValue(ctx context.Context, conn *pgx.Conn, cfg config) {
+type multiValueExecutor struct {
+	cfg config
+}
+
+func (e multiValueExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
 
 	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
 
@@ -204,7 +224,12 @@ func executeMultiValue(ctx context.Context, conn *pgx.Conn, cfg config) {
 	// dumpPreparedStatements(ctx, conn)
 }
 
-func executeBatch(ctx context.Context, conn *pgx.Conn, cfg config) {
+type simplePgxBatchExecutor struct {
+	cfg config
+}
+
+func (e simplePgxBatchExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
 
 	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
 
