@@ -4,6 +4,7 @@ import (
 	"os/signal"
 	"context"
 	"flag"
+	"strings"
 	"fmt"
 	"math/rand"
 	"os"
@@ -76,7 +77,8 @@ func main() {
 	for {
 		select {
 		case <-ticker.C:
-			executeBatch(ctx, conn, cfg)
+			// executeBatch(ctx, conn, cfg)
+			executeMultiValue(ctx, conn, cfg)
 		case <-ctx.Done():
 			fmt.Println("Exiting due to context cancellation")
 			return
@@ -104,6 +106,102 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create table: %v", err))
 	}
+}
+
+func executeMultiValue(ctx context.Context, conn *pgx.Conn, cfg config) {
+
+	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
+
+	totalRecords := cfg.scale * totalRecords
+
+	numUpdates := int(float64(totalRecords) * updatePct)
+	numInserts := totalRecords - numUpdates
+
+	totalOps := numInserts + numUpdates
+	batch := &pgx.Batch{}
+
+	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
+	// Get max seq_id to use for updates
+	type updateInfo struct {
+		SeqID int64 `db:"seq_id"`
+		Time time.Time `db:"time"`
+	}
+
+
+	queryUpdateTime := time.Now()
+
+	// generic plan after inserting and updates is slow, so we force custom plan
+	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
+	if err != nil {
+		fmt.Printf("Failed to set plan cache mode: %v\n", err)
+		return
+	}
+
+	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
+	rows, err := conn.Query(ctx, maxQuery, numUpdates)
+	if err != nil {
+		fmt.Printf("Failed to get max seq_id: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
+	if err != nil {
+		fmt.Printf("Failed to collect rows: %v\n", err)
+		return
+	}
+	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
+
+
+	batch.Queue(
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
+	)
+
+	insertSQL := fmt.Sprintf("INSERT INTO %s (id, time, name, value) VALUES", relName)
+	values := make([]any, 0, numInserts*4)
+	placeholders := make([]string, 0, numInserts)
+	for i := 0; i < numInserts; i++ {
+		placeholders = append(placeholders, fmt.Sprintf("($%d, $%d, $%d, $%d)", i*4+1, i*4+2, i*4+3, i*4+4))
+		values = append(values,
+			rand.Intn(10000), time.Now(), fmt.Sprintf("metric_%d", rand.Intn(1000)), rand.Float64()*100,
+		)
+	}
+	if len(placeholders) > 0 {
+		insertSQL += strings.Join(placeholders, ", ")
+		batch.Queue(
+			insertSQL,
+			values...,
+		)
+	} else {
+		fmt.Println("No inserts to queue, skipping insert batch")
+	}
+
+
+	updateSQL := fmt.Sprintf("UPDATE %[1]s SET value = $1 WHERE time=$2 AND seq_id=$3", relName)
+	for _, u := range updates {
+		value := rand.Float64() * 100000 // Random value for update
+		batch.Queue(
+			updateSQL,
+			value,
+			u.Time, // Use the time from the update info
+			u.SeqID, // Use the max seq_id from the update info
+		)
+	}
+
+	start := time.Now()
+
+	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
+	err = conn.SendBatch(ctx, batch).Close()
+	if	err != nil {
+		fmt.Printf("Failed to execute batch: %v\n", err)
+		return
+	}
+	duration := time.Since(start).Seconds()
+	if duration > 0 {
+		rate := float64(totalOps) / duration
+		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
+	}
+	// dumpPreparedStatements(ctx, conn)
 }
 
 func executeBatch(ctx context.Context, conn *pgx.Conn, cfg config) {
