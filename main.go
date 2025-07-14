@@ -197,15 +197,27 @@ func (e multiValueExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	}
 
 
-	updateSQL := fmt.Sprintf("UPDATE %[1]s SET value = $1 WHERE time=$2 AND seq_id=$3", relName)
-	for _, u := range updates {
+	updateSQL := `UPDATE %[1]s AS t SET value = v.value::numeric
+		FROM (
+			VALUES %s
+		) AS v(value, time, seq_id)
+		WHERE t.time=v.time AND t.seq_id=v.seq_id
+	`
+	placeholders = make([]string, 0, len(updates))
+	values = make([]any, 0, len(updates)*3)
+	for i, u := range updates {
 		value := rand.Float64() * 100000 // Random value for update
+		placeholders = append(placeholders, fmt.Sprintf("($%d::numeric, $%d::timestamptz, $%d::bigint)", i*3+1, i*3+2, i*3+3))
+		values = append(values, value, u.Time, u.SeqID)
+	}
+	if len(placeholders) > 0 {
+		updateSQL = fmt.Sprintf(updateSQL, relName, strings.Join(placeholders, ", "))
 		batch.Queue(
 			updateSQL,
-			value,
-			u.Time, // Use the time from the update info
-			u.SeqID, // Use the max seq_id from the update info
+			values...,
 		)
+	} else {
+		fmt.Println("No updates to queue, skipping update batch")
 	}
 
 	start := time.Now()
