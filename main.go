@@ -90,6 +90,8 @@ func main() {
 		exec = unnestExecutor{cfg: cfg}
 	case "temp_table":
 		exec = tempTableExecutor{cfg: cfg}
+	case "temp_json":
+		exec = tempJsonExecutor{cfg: cfg}
 	default:
 		panic(fmt.Sprintf("Unknown mode: %s", cfg.mode))
 	}
@@ -127,6 +129,172 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 	}
 }
 
+type tempJsonExecutor struct {
+	cfg config
+}
+
+func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
+
+	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
+
+	totalRecords := cfg.scale * totalRecords
+
+	numUpdates := int(float64(totalRecords) * updatePct)
+	numInserts := totalRecords - numUpdates
+
+	totalOps := numInserts + numUpdates
+	batch := &pgx.Batch{}
+
+	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
+	// Get max seq_id to use for updates
+	type updateInfo struct {
+		SeqID int64 `db:"seq_id"`
+		Time time.Time `db:"time"`
+	}
+
+
+	queryUpdateTime := time.Now()
+
+	// generic plan after inserting and updates is slow, so we force custom plan
+	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
+	if err != nil {
+		fmt.Printf("Failed to set plan cache mode: %v\n", err)
+		return
+	}
+
+	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
+	rows, err := conn.Query(ctx, maxQuery, numUpdates)
+	if err != nil {
+		fmt.Printf("Failed to get max seq_id: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
+	if err != nil {
+		fmt.Printf("Failed to collect rows: %v\n", err)
+		return
+	}
+	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
+
+
+	batch.Queue(
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
+	)
+
+	// Create a temporary table for the batch
+	tempTableDDL := `
+		CREATE TEMP TABLE IF NOT EXISTS cdc_stagging (
+			id bigserial PRIMARY KEY,
+			dest_table NAME,
+			op varchar(1),
+			payload jsonb,
+			where_clause jsonb
+		);
+		TRUNCATE TABLE cdc_stagging;
+		-- CREATE INDEX IF NOT EXISTS cdc_stagging_op_idx ON cdc_stagging (op);
+		`
+
+	_, err = conn.Exec(ctx, tempTableDDL)
+	if err != nil {
+		fmt.Printf("Failed to create temporary table: %v\n", err)
+		return
+	}
+
+
+	rowsInserted := 0
+	copyFromFunc := func() (row []any, err error) {
+		if rowsInserted >= numInserts {
+			return nil, nil
+		}
+		rowsInserted++
+		return []any{
+			"metrics1", // dest_table
+			"I", // op
+			map[string]any{
+				"id":    rand.Intn(10000),
+				"time":  time.Now(),
+				"name":  fmt.Sprintf("metric_%d", rand.Intn(1000)),
+				"value":  rand.Float64() * 100,
+			}, // payload
+		}, nil
+	}
+
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{"cdc_stagging"}, []string{"dest_table", "op", "payload"}, pgx.CopyFromFunc(copyFromFunc))
+	if err != nil {
+		fmt.Printf("Failed to copy data into temporary table: %v\n", err)
+		return
+	}
+
+
+	rowsUpdated := 0
+	copyFromUpdateFunc := func() (row []any, err error) {
+		if rowsUpdated >= len(updates) {
+			return nil, nil
+		}
+		rowsUpdated++
+		return []any {
+			"metrics1", // dest_table
+			"U", // op
+			map[string]any{
+				"value": rand.Float64() * 100000, // Random value for update
+			}, // payload
+			map[string]any{
+				"time":  updates[rowsUpdated - 1].Time,
+				"seq_id": updates[rowsUpdated - 1].SeqID,
+			},
+		}, nil
+	}
+
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{"cdc_stagging"}, []string{"dest_table", "op", "payload", "where_clause"}, pgx.CopyFromFunc(copyFromUpdateFunc))
+	if err != nil {
+		fmt.Printf("Failed to copy data for updates into temporary table: %v\n", err)
+		return
+	}
+
+
+	insertSQL := fmt.Sprintf(
+		`INSERT INTO %s (id, time, name, value)
+		SELECT (payload->>'id')::integer, (payload->>'time')::timestamptz, (payload->>'name')::text, (payload->>'value')::numeric
+		FROM cdc_stagging
+		WHERE op = 'I'`,
+		relName,
+	)
+
+	batch.Queue(
+		insertSQL,
+	)
+
+	// updates
+	updateSQL := fmt.Sprintf(
+		`UPDATE %[1]s AS t SET value = (v.payload->>'value')::numeric
+		FROM cdc_stagging AS v
+		WHERE t.time = (v.where_clause->>'time')::timestamptz AND t.seq_id = (v.where_clause->>'seq_id')::bigint
+		AND v.op = 'U'
+	`,
+		relName,
+	)
+
+	batch.Queue(
+		updateSQL,
+	)
+
+	start := time.Now()
+
+	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
+	err = conn.SendBatch(ctx, batch).Close()
+	if	err != nil {
+		fmt.Printf("Failed to execute batch: %v\n", err)
+		return
+	}
+	duration := time.Since(start).Seconds()
+	if duration > 0 {
+		rate := float64(totalOps) / duration
+		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
+	}
+	// dumpPreparedStatements(ctx, conn)
+}
 type tempTableExecutor struct {
 	cfg config
 }
