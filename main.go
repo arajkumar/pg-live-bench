@@ -86,6 +86,8 @@ func main() {
 		exec = multiValueExecutor{cfg: cfg}
 	case "simple_pgx_batch":
 		exec = simplePgxBatchExecutor{cfg: cfg}
+	case "unnest":
+		exec = unnestExecutor{cfg: cfg}
 	default:
 		panic(fmt.Sprintf("Unknown mode: %s", cfg.mode))
 	}
@@ -123,6 +125,133 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 	}
 }
 
+type unnestExecutor struct {
+	cfg config
+}
+
+func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
+
+	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
+
+	totalRecords := cfg.scale * totalRecords
+
+	numUpdates := int(float64(totalRecords) * updatePct)
+	numInserts := totalRecords - numUpdates
+
+	totalOps := numInserts + numUpdates
+	batch := &pgx.Batch{}
+
+	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
+	// Get max seq_id to use for updates
+	type updateInfo struct {
+		SeqID int64 `db:"seq_id"`
+		Time time.Time `db:"time"`
+	}
+
+
+	queryUpdateTime := time.Now()
+
+	// generic plan after inserting and updates is slow, so we force custom plan
+	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
+	if err != nil {
+		fmt.Printf("Failed to set plan cache mode: %v\n", err)
+		return
+	}
+
+	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
+	rows, err := conn.Query(ctx, maxQuery, numUpdates)
+	if err != nil {
+		fmt.Printf("Failed to get max seq_id: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
+	if err != nil {
+		fmt.Printf("Failed to collect rows: %v\n", err)
+		return
+	}
+	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
+
+
+	batch.Queue(
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
+	)
+
+	insertSQL := fmt.Sprintf(
+		`INSERT INTO %s (id, time, name, value)
+		SELECT id, time, name, value FROM unnest(
+			$1::integer[],
+			$2::timestamptz[],
+			$3::text[],
+			$4::numeric[]
+		) AS t(id, time, name, value)`,
+		relName,
+	)
+
+	values := make([][]any, 4)
+	params := make([]any, len(values))
+	for i := range values {
+		values[i] = make([]any, numInserts)
+		params[i] = values[i]
+	}
+
+	for i := 0; i < numInserts; i++ {
+		values[0][i] = rand.Intn(10000) // id
+		values[1][i] = time.Now() // time
+		values[2][i] = fmt.Sprintf("metric_%d", rand.Intn(1000)) // name
+		values[3][i] = rand.Float64() * 100 // value
+	}
+
+	batch.Queue(
+		insertSQL,
+		params...,
+	)
+
+	// updates
+	updateSQL := `UPDATE %[1]s AS t SET value = v.value::numeric
+		FROM (
+			SELECT value, time, seq_id FROM unnest(
+				$1::numeric[],
+				$2::timestamptz[],
+				$3::bigint[]
+			) AS t(value, time, seq_id)
+		) AS v
+		WHERE t.time=v.time AND t.seq_id=v.seq_id
+	`
+	values = make([][]any, 3)
+	params = make([]any, len(values))
+	for i := range values {
+		values[i] = make([]any, len(updates))
+		params[i] = values[i]
+	}
+	for i, u := range updates {
+		values[0][i] = rand.Float64() * 100000 // Random value for update
+		values[1][i] = u.Time // Use the time from the update info
+		values[2][i] = u.SeqID // Use the max seq_id from the update info
+	}
+
+	batch.Queue(
+		fmt.Sprintf(updateSQL, relName),
+		params...,
+	)
+
+	start := time.Now()
+
+	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
+	err = conn.SendBatch(ctx, batch).Close()
+	if	err != nil {
+		fmt.Printf("Failed to execute batch: %v\n", err)
+		return
+	}
+	duration := time.Since(start).Seconds()
+	if duration > 0 {
+		rate := float64(totalOps) / duration
+		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
+	}
+	// dumpPreparedStatements(ctx, conn)
+}
 type multiValueExecutor struct {
 	cfg config
 }
