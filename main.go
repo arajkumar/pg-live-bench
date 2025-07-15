@@ -88,6 +88,8 @@ func main() {
 		exec = simplePgxBatchExecutor{cfg: cfg}
 	case "unnest":
 		exec = unnestExecutor{cfg: cfg}
+	case "temp_table":
+		exec = tempTableExecutor{cfg: cfg}
 	default:
 		panic(fmt.Sprintf("Unknown mode: %s", cfg.mode))
 	}
@@ -123,6 +125,167 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create table: %v", err))
 	}
+}
+
+type tempTableExecutor struct {
+	cfg config
+}
+
+func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
+
+	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
+
+	totalRecords := cfg.scale * totalRecords
+
+	numUpdates := int(float64(totalRecords) * updatePct)
+	numInserts := totalRecords - numUpdates
+
+	totalOps := numInserts + numUpdates
+	batch := &pgx.Batch{}
+
+	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
+	// Get max seq_id to use for updates
+	type updateInfo struct {
+		SeqID int64 `db:"seq_id"`
+		Time time.Time `db:"time"`
+	}
+
+
+	queryUpdateTime := time.Now()
+
+	// generic plan after inserting and updates is slow, so we force custom plan
+	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
+	if err != nil {
+		fmt.Printf("Failed to set plan cache mode: %v\n", err)
+		return
+	}
+
+	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
+	rows, err := conn.Query(ctx, maxQuery, numUpdates)
+	if err != nil {
+		fmt.Printf("Failed to get max seq_id: %v\n", err)
+		return
+	}
+	defer rows.Close()
+
+	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
+	if err != nil {
+		fmt.Printf("Failed to collect rows: %v\n", err)
+		return
+	}
+	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
+
+
+	batch.Queue(
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
+	)
+
+	// Create a temporary table for the batch
+	tempTableName := "tmp_" + cfg.tableName
+	tempTableDDL := fmt.Sprintf(`
+		CREATE TEMP TABLE IF NOT EXISTS %s (
+			id integer,
+			time timestamptz,
+			name text,
+			value numeric,
+			seq_id bigserial,
+			old_time timestamptz,
+			old_seq_id bigint
+		);
+	`, pgx.Identifier{tempTableName}.Sanitize())
+
+	_, err = conn.Exec(ctx, tempTableDDL)
+	if err != nil {
+		fmt.Printf("Failed to create temporary table: %v\n", err)
+		return
+	}
+
+
+	rowsInserted := 0
+	copyFromFunc := func() (row []any, err error) {
+		if rowsInserted >= numInserts {
+			return nil, nil
+		}
+		rowsInserted++
+		return []any{
+			rand.Intn(10000),
+			time.Now(),
+			fmt.Sprintf("metric_%d", rand.Intn(1000)),
+			rand.Float64() * 100,
+		}, nil
+	}
+
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{tempTableName}, []string{"id", "time", "name", "value"}, pgx.CopyFromFunc(copyFromFunc))
+	if err != nil {
+		fmt.Printf("Failed to copy data into temporary table: %v\n", err)
+		return
+	}
+
+
+	rowsUpdated := 0
+	copyFromUpdateFunc := func() (row []any, err error) {
+		if rowsUpdated >= len(updates) {
+			return nil, nil
+		}
+		rowsUpdated++
+		return []any {
+			rand.Float64() * 100000, // Random value for update
+			updates[rowsUpdated - 1].Time, // Use the time from the update info
+			updates[rowsUpdated - 1].SeqID, // Use the max seq_id from the update info
+		}, nil
+	}
+
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{tempTableName}, []string{"value", "old_time", "old_seq_id"}, pgx.CopyFromFunc(copyFromUpdateFunc))
+	if err != nil {
+		fmt.Printf("Failed to copy data for updates into temporary table: %v\n", err)
+		return
+	}
+
+
+	insertSQL := fmt.Sprintf(
+		`INSERT INTO %s (id, time, name, value)
+		SELECT id, time, name, value FROM %s WHERE id IS NOT NULL AND time IS NOT NULL AND name IS NOT NULL AND value IS NOT NULL`,
+		relName,
+		pgx.Identifier{tempTableName}.Sanitize(),
+	)
+
+	batch.Queue(
+		insertSQL,
+	)
+
+	// updates
+	updateSQL := fmt.Sprintf(`UPDATE %[1]s AS t SET value = v.value::numeric
+		FROM %[2]s AS v
+		WHERE t.time=v.old_time AND t.seq_id=v.old_seq_id
+		AND v.time IS NOT NULL AND v.seq_id IS NOT NULL
+	`,
+		relName,
+		pgx.Identifier{tempTableName}.Sanitize(),
+	)
+
+	batch.Queue(
+		updateSQL,
+	)
+
+	batch.Queue(
+		"TRUNCATE TABLE " + pgx.Identifier{tempTableName}.Sanitize(),
+	)
+
+	start := time.Now()
+
+	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
+	err = conn.SendBatch(ctx, batch).Close()
+	if	err != nil {
+		fmt.Printf("Failed to execute batch: %v\n", err)
+		return
+	}
+	duration := time.Since(start).Seconds()
+	if duration > 0 {
+		rate := float64(totalOps) / duration
+		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
+	}
+	// dumpPreparedStatements(ctx, conn)
 }
 
 type unnestExecutor struct {
