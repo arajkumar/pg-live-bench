@@ -122,7 +122,6 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 		pgx.Identifier{cfg.tableName + "_time_idx"}.Sanitize(),
 	)
 
-	fmt.Println("Creating table with DDL:", ddl)
 	_, err := conn.Exec(ctx, ddl)
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create table: %v", err))
