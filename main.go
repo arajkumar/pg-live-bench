@@ -217,6 +217,9 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	}
 
 
+	// account copy time as well
+	start := time.Now()
+
 	rowsInserted := 0
 	copyFromFunc := func() (row []any, err error) {
 		if rowsInserted >= numInserts {
@@ -294,7 +297,6 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		updateSQL,
 	)
 
-	start := time.Now()
 
 	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
 	err = conn.SendBatch(ctx, batch).Close()
@@ -346,6 +348,9 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		return
 	}
 
+
+	// account copy time as well
+	start := time.Now()
 
 	rowsInserted := 0
 	copyFromFunc := func() (row []any, err error) {
@@ -413,7 +418,6 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		updateSQL,
 	)
 
-	start := time.Now()
 
 	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
 	err = conn.SendBatch(ctx, batch).Close()
