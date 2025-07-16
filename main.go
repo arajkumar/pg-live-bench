@@ -40,7 +40,7 @@ func main() {
 	flag.StringVar(&cfg.schemaName, "schema", "public", "Schema name to use for the benchmark")
 	flag.StringVar(&cfg.tableName, "table", "metrics", "Table name to use for the benchmark")
 	flag.IntVar(&cfg.scale, "scale", 1, "Scale factor for the number of records (default is 1x, 10000 records)")
-	flag.StringVar(&cfg.planCacheMode, "plan_cache_mode", "force_generic_plan", "Plan cache mode to use for the connection")
+	flag.StringVar(&cfg.planCacheMode, "plan_cache_mode", "auto", "Plan cache mode to use for the connection")
 	flag.Float64Var(&cfg.minUpdatePct, "min_update_pct", 0.1, "Minimum percentage of updates in the batch (default is 0.1)")
 	flag.Float64Var(&cfg.maxUpdatePct, "max_update_pct", 0.3, "Maximum percentage of updates in the batch (default is 0.3)")
 	flag.StringVar(&cfg.mode, "mode", "multi_value", "Execution mode: 'multi_value' or 'simple_pgx_batch'")
@@ -128,6 +128,58 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 	}
 }
 
+func (c config) ops() (totalOps, numInserts, numUpdates int) {
+	updatePct := c.minUpdatePct + rand.Float64()*(c.maxUpdatePct-c.minUpdatePct)
+
+	totalRecords := c.scale * totalRecords
+
+	numUpdates = int(float64(totalRecords) * updatePct)
+	numInserts = totalRecords - numUpdates
+
+	totalOps = numInserts + numUpdates
+	return totalOps, numInserts, numUpdates
+}
+
+func (c config) relName() string {
+	return pgx.Identifier{c.schemaName, c.tableName}.Sanitize()
+}
+
+// Get max seq_id to use for updates
+type updateInfo struct {
+	SeqID int64 `db:"seq_id"`
+	Time time.Time `db:"time"`
+}
+
+func (c config) updateRecords(
+	ctx context.Context, conn *pgx.Conn, numUpdates int,
+) []updateInfo {
+	queryUpdateTime := time.Now()
+
+	// generic plan after inserting and updates is slow, so we force custom plan
+	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
+	if err != nil {
+		fmt.Printf("Failed to set plan cache mode: %v\n", err)
+		return nil
+	}
+
+	relName := pgx.Identifier{c.schemaName, c.tableName}.Sanitize()
+	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
+	rows, err := conn.Query(ctx, maxQuery, numUpdates)
+	if err != nil {
+		fmt.Printf("Failed to get max seq_id: %v\n", err)
+		return nil
+	}
+	defer rows.Close()
+
+	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
+	if err != nil {
+		fmt.Printf("Failed to collect rows: %v\n", err)
+		return nil
+	}
+	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
+	return updates
+}
+
 type tempJsonExecutor struct {
 	cfg config
 }
@@ -135,57 +187,20 @@ type tempJsonExecutor struct {
 func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	cfg := e.cfg
 
-	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
-
-	totalRecords := cfg.scale * totalRecords
-
-	numUpdates := int(float64(totalRecords) * updatePct)
-	numInserts := totalRecords - numUpdates
-
-	totalOps := numInserts + numUpdates
 	batch := &pgx.Batch{}
-
-	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
-	// Get max seq_id to use for updates
-	type updateInfo struct {
-		SeqID int64 `db:"seq_id"`
-		Time time.Time `db:"time"`
-	}
-
-
-	queryUpdateTime := time.Now()
-
-	// generic plan after inserting and updates is slow, so we force custom plan
-	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
-	if err != nil {
-		fmt.Printf("Failed to set plan cache mode: %v\n", err)
-		return
-	}
-
-	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
-	rows, err := conn.Query(ctx, maxQuery, numUpdates)
-	if err != nil {
-		fmt.Printf("Failed to get max seq_id: %v\n", err)
-		return
-	}
-	defer rows.Close()
-
-	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
-	if err != nil {
-		fmt.Printf("Failed to collect rows: %v\n", err)
-		return
-	}
-	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
-
 
 	batch.Queue(
 		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
 	)
 
+	totalOps, numInserts, numUpdates := cfg.ops()
+
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
+
 	// Create a temporary table for the batch
 	tempTableDDL := `
 		CREATE TEMP TABLE IF NOT EXISTS cdc_stagging (
-			id bigserial PRIMARY KEY,
+			id bigserial, -- this should be the primary key for operation ordering
 			dest_table NAME,
 			op varchar(1),
 			payload jsonb,
@@ -195,7 +210,7 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		-- CREATE INDEX IF NOT EXISTS cdc_stagging_op_idx ON cdc_stagging (op);
 		`
 
-	_, err = conn.Exec(ctx, tempTableDDL)
+	_, err := conn.Exec(ctx, tempTableDDL)
 	if err != nil {
 		fmt.Printf("Failed to create temporary table: %v\n", err)
 		return
@@ -209,7 +224,7 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		}
 		rowsInserted++
 		return []any{
-			"metrics1", // dest_table
+			cfg.relName(), // dest_table
 			"I", // op
 			map[string]any{
 				"id":    rand.Intn(10000),
@@ -234,7 +249,7 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		}
 		rowsUpdated++
 		return []any {
-			"metrics1", // dest_table
+			cfg.relName(), // dest_table
 			"U", // op
 			map[string]any{
 				"value": rand.Float64() * 100000, // Random value for update
@@ -258,7 +273,7 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		SELECT (payload->>'id')::integer, (payload->>'time')::timestamptz, (payload->>'name')::text, (payload->>'value')::numeric
 		FROM cdc_stagging
 		WHERE op = 'I'`,
-		relName,
+		cfg.relName(),
 	)
 
 	batch.Queue(
@@ -272,7 +287,7 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		WHERE t.time = (v.where_clause->>'time')::timestamptz AND t.seq_id = (v.where_clause->>'seq_id')::bigint
 		AND v.op = 'U'
 	`,
-		relName,
+		cfg.relName(),
 	)
 
 	batch.Queue(
@@ -292,7 +307,6 @@ func (e tempJsonExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		rate := float64(totalOps) / duration
 		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
 	}
-	// dumpPreparedStatements(ctx, conn)
 }
 type tempTableExecutor struct {
 	cfg config
@@ -301,48 +315,10 @@ type tempTableExecutor struct {
 func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	cfg := e.cfg
 
-	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
-
-	totalRecords := cfg.scale * totalRecords
-
-	numUpdates := int(float64(totalRecords) * updatePct)
-	numInserts := totalRecords - numUpdates
-
-	totalOps := numInserts + numUpdates
 	batch := &pgx.Batch{}
+	totalOps, numInserts, numUpdates := cfg.ops()
 
-	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
-	// Get max seq_id to use for updates
-	type updateInfo struct {
-		SeqID int64 `db:"seq_id"`
-		Time time.Time `db:"time"`
-	}
-
-
-	queryUpdateTime := time.Now()
-
-	// generic plan after inserting and updates is slow, so we force custom plan
-	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
-	if err != nil {
-		fmt.Printf("Failed to set plan cache mode: %v\n", err)
-		return
-	}
-
-	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
-	rows, err := conn.Query(ctx, maxQuery, numUpdates)
-	if err != nil {
-		fmt.Printf("Failed to get max seq_id: %v\n", err)
-		return
-	}
-	defer rows.Close()
-
-	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
-	if err != nil {
-		fmt.Printf("Failed to collect rows: %v\n", err)
-		return
-	}
-	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
-
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
 
 	batch.Queue(
 		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
@@ -351,18 +327,20 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	// Create a temporary table for the batch
 	tempTableName := "tmp_" + cfg.tableName
 	tempTableDDL := fmt.Sprintf(`
-		CREATE TEMP TABLE IF NOT EXISTS %s (
+		CREATE TEMP TABLE IF NOT EXISTS %[1]s (
+			_op varchar(1),
 			id integer,
 			time timestamptz,
 			name text,
 			value numeric,
-			seq_id bigserial,
+			seq_id bigint,
 			old_time timestamptz,
 			old_seq_id bigint
 		);
+		TRUNCATE TABLE %[1]s;
 	`, pgx.Identifier{tempTableName}.Sanitize())
 
-	_, err = conn.Exec(ctx, tempTableDDL)
+	_, err := conn.Exec(ctx, tempTableDDL)
 	if err != nil {
 		fmt.Printf("Failed to create temporary table: %v\n", err)
 		return
@@ -376,6 +354,7 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		}
 		rowsInserted++
 		return []any{
+			"I", // op
 			rand.Intn(10000),
 			time.Now(),
 			fmt.Sprintf("metric_%d", rand.Intn(1000)),
@@ -383,12 +362,11 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		}, nil
 	}
 
-	_, err = conn.CopyFrom(ctx, pgx.Identifier{tempTableName}, []string{"id", "time", "name", "value"}, pgx.CopyFromFunc(copyFromFunc))
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{tempTableName}, []string{"_op", "id", "time", "name", "value"}, pgx.CopyFromFunc(copyFromFunc))
 	if err != nil {
 		fmt.Printf("Failed to copy data into temporary table: %v\n", err)
 		return
 	}
-
 
 	rowsUpdated := 0
 	copyFromUpdateFunc := func() (row []any, err error) {
@@ -397,13 +375,14 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		}
 		rowsUpdated++
 		return []any {
+			"U", // op
 			rand.Float64() * 100000, // Random value for update
 			updates[rowsUpdated - 1].Time, // Use the time from the update info
 			updates[rowsUpdated - 1].SeqID, // Use the max seq_id from the update info
 		}, nil
 	}
 
-	_, err = conn.CopyFrom(ctx, pgx.Identifier{tempTableName}, []string{"value", "old_time", "old_seq_id"}, pgx.CopyFromFunc(copyFromUpdateFunc))
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{tempTableName}, []string{"_op", "value", "old_time", "old_seq_id"}, pgx.CopyFromFunc(copyFromUpdateFunc))
 	if err != nil {
 		fmt.Printf("Failed to copy data for updates into temporary table: %v\n", err)
 		return
@@ -412,8 +391,8 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 
 	insertSQL := fmt.Sprintf(
 		`INSERT INTO %s (id, time, name, value)
-		SELECT id, time, name, value FROM %s WHERE id IS NOT NULL AND time IS NOT NULL AND name IS NOT NULL AND value IS NOT NULL`,
-		relName,
+		SELECT id, time, name, value FROM %s WHERE _op = 'I'`,
+		cfg.relName(),
 		pgx.Identifier{tempTableName}.Sanitize(),
 	)
 
@@ -424,19 +403,14 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	// updates
 	updateSQL := fmt.Sprintf(`UPDATE %[1]s AS t SET value = v.value::numeric
 		FROM %[2]s AS v
-		WHERE t.time=v.old_time AND t.seq_id=v.old_seq_id
-		AND v.time IS NOT NULL AND v.seq_id IS NOT NULL
+		WHERE t.time=v.old_time AND t.seq_id=v.old_seq_id AND v._op = 'U'
 	`,
-		relName,
+		cfg.relName(),
 		pgx.Identifier{tempTableName}.Sanitize(),
 	)
 
 	batch.Queue(
 		updateSQL,
-	)
-
-	batch.Queue(
-		"TRUNCATE TABLE " + pgx.Identifier{tempTableName}.Sanitize(),
 	)
 
 	start := time.Now()
@@ -452,7 +426,6 @@ func (e tempTableExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		rate := float64(totalOps) / duration
 		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
 	}
-	// dumpPreparedStatements(ctx, conn)
 }
 
 type unnestExecutor struct {
@@ -462,48 +435,10 @@ type unnestExecutor struct {
 func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	cfg := e.cfg
 
-	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
-
-	totalRecords := cfg.scale * totalRecords
-
-	numUpdates := int(float64(totalRecords) * updatePct)
-	numInserts := totalRecords - numUpdates
-
-	totalOps := numInserts + numUpdates
 	batch := &pgx.Batch{}
+	totalOps, numInserts, numUpdates := cfg.ops()
 
-	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
-	// Get max seq_id to use for updates
-	type updateInfo struct {
-		SeqID int64 `db:"seq_id"`
-		Time time.Time `db:"time"`
-	}
-
-
-	queryUpdateTime := time.Now()
-
-	// generic plan after inserting and updates is slow, so we force custom plan
-	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
-	if err != nil {
-		fmt.Printf("Failed to set plan cache mode: %v\n", err)
-		return
-	}
-
-	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
-	rows, err := conn.Query(ctx, maxQuery, numUpdates)
-	if err != nil {
-		fmt.Printf("Failed to get max seq_id: %v\n", err)
-		return
-	}
-	defer rows.Close()
-
-	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
-	if err != nil {
-		fmt.Printf("Failed to collect rows: %v\n", err)
-		return
-	}
-	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
-
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
 
 	batch.Queue(
 		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
@@ -517,7 +452,7 @@ func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 			$3::text[],
 			$4::numeric[]
 		) AS t(id, time, name, value)`,
-		relName,
+		cfg.relName(),
 	)
 
 	values := make([][]any, 4)
@@ -563,14 +498,14 @@ func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	}
 
 	batch.Queue(
-		fmt.Sprintf(updateSQL, relName),
+		fmt.Sprintf(updateSQL, cfg.relName()),
 		params...,
 	)
 
 	start := time.Now()
 
 	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
-	err = conn.SendBatch(ctx, batch).Close()
+	err := conn.SendBatch(ctx, batch).Close()
 	if	err != nil {
 		fmt.Printf("Failed to execute batch: %v\n", err)
 		return
@@ -580,8 +515,8 @@ func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		rate := float64(totalOps) / duration
 		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
 	}
-	// dumpPreparedStatements(ctx, conn)
 }
+
 type multiValueExecutor struct {
 	cfg config
 }
@@ -589,54 +524,16 @@ type multiValueExecutor struct {
 func (e multiValueExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	cfg := e.cfg
 
-	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
-
-	totalRecords := cfg.scale * totalRecords
-
-	numUpdates := int(float64(totalRecords) * updatePct)
-	numInserts := totalRecords - numUpdates
-
-	totalOps := numInserts + numUpdates
 	batch := &pgx.Batch{}
+	totalOps, numInserts, numUpdates := cfg.ops()
 
-	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
-	// Get max seq_id to use for updates
-	type updateInfo struct {
-		SeqID int64 `db:"seq_id"`
-		Time time.Time `db:"time"`
-	}
-
-
-	queryUpdateTime := time.Now()
-
-	// generic plan after inserting and updates is slow, so we force custom plan
-	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
-	if err != nil {
-		fmt.Printf("Failed to set plan cache mode: %v\n", err)
-		return
-	}
-
-	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
-	rows, err := conn.Query(ctx, maxQuery, numUpdates)
-	if err != nil {
-		fmt.Printf("Failed to get max seq_id: %v\n", err)
-		return
-	}
-	defer rows.Close()
-
-	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
-	if err != nil {
-		fmt.Printf("Failed to collect rows: %v\n", err)
-		return
-	}
-	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
-
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
 
 	batch.Queue(
 		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
 	)
 
-	insertSQL := fmt.Sprintf("INSERT INTO %s (id, time, name, value) VALUES", relName)
+	insertSQL := fmt.Sprintf("INSERT INTO %s (id, time, name, value) VALUES", cfg.relName())
 	values := make([]any, 0, numInserts*4)
 	placeholders := make([]string, 0, numInserts)
 	for i := 0; i < numInserts; i++ {
@@ -655,7 +552,6 @@ func (e multiValueExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		fmt.Println("No inserts to queue, skipping insert batch")
 	}
 
-
 	updateSQL := `UPDATE %[1]s AS t SET value = v.value::numeric
 		FROM (
 			VALUES %s
@@ -670,7 +566,7 @@ func (e multiValueExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		values = append(values, value, u.Time, u.SeqID)
 	}
 	if len(placeholders) > 0 {
-		updateSQL = fmt.Sprintf(updateSQL, relName, strings.Join(placeholders, ", "))
+		updateSQL = fmt.Sprintf(updateSQL, cfg.relName(), strings.Join(placeholders, ", "))
 		batch.Queue(
 			updateSQL,
 			values...,
@@ -682,7 +578,7 @@ func (e multiValueExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	start := time.Now()
 
 	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
-	err = conn.SendBatch(ctx, batch).Close()
+	err := conn.SendBatch(ctx, batch).Close()
 	if	err != nil {
 		fmt.Printf("Failed to execute batch: %v\n", err)
 		return
@@ -692,7 +588,6 @@ func (e multiValueExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		rate := float64(totalOps) / duration
 		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
 	}
-	// dumpPreparedStatements(ctx, conn)
 }
 
 type simplePgxBatchExecutor struct {
@@ -702,54 +597,16 @@ type simplePgxBatchExecutor struct {
 func (e simplePgxBatchExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	cfg := e.cfg
 
-	updatePct := cfg.minUpdatePct + rand.Float64()*(cfg.maxUpdatePct-cfg.minUpdatePct)
-
-	totalRecords := cfg.scale * totalRecords
-
-	numUpdates := int(float64(totalRecords) * updatePct)
-	numInserts := totalRecords - numUpdates
-
-	totalOps := numInserts + numUpdates
 	batch := &pgx.Batch{}
+	totalOps, numInserts, numUpdates := cfg.ops()
 
-	relName := pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()
-	// Get max seq_id to use for updates
-	type updateInfo struct {
-		SeqID int64 `db:"seq_id"`
-		Time time.Time `db:"time"`
-	}
-
-
-	queryUpdateTime := time.Now()
-
-	// generic plan after inserting and updates is slow, so we force custom plan
-	_, err := conn.Exec(ctx, "SET plan_cache_mode = 'force_custom_plan'")
-	if err != nil {
-		fmt.Printf("Failed to set plan cache mode: %v\n", err)
-		return
-	}
-
-	maxQuery := fmt.Sprintf("SELECT seq_id, time FROM %s ORDER BY time DESC LIMIT $1", relName)
-	rows, err := conn.Query(ctx, maxQuery, numUpdates)
-	if err != nil {
-		fmt.Printf("Failed to get max seq_id: %v\n", err)
-		return
-	}
-	defer rows.Close()
-
-	updates, err := pgx.CollectRows(rows, pgx.RowToStructByName[updateInfo])
-	if err != nil {
-		fmt.Printf("Failed to collect rows: %v\n", err)
-		return
-	}
-	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
-
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
 
 	batch.Queue(
 		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
 	)
 
-	insertSQL := fmt.Sprintf("INSERT INTO %s (id, time, name, value) VALUES ($1, $2, $3, $4)", relName)
+	insertSQL := fmt.Sprintf("INSERT INTO %s (id, time, name, value) VALUES ($1, $2, $3, $4)", cfg.relName())
 	for i := 0; i < numInserts; i++ {
 		batch.Queue(
 			insertSQL,
@@ -757,7 +614,7 @@ func (e simplePgxBatchExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		)
 	}
 
-	updateSQL := fmt.Sprintf("UPDATE %[1]s SET value = $1 WHERE time=$2 AND seq_id=$3", relName)
+	updateSQL := fmt.Sprintf("UPDATE %[1]s SET value = $1 WHERE time=$2 AND seq_id=$3", cfg.relName())
 	for _, u := range updates {
 		value := rand.Float64() * 100000 // Random value for update
 		batch.Queue(
@@ -771,7 +628,7 @@ func (e simplePgxBatchExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	start := time.Now()
 
 	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
-	err = conn.SendBatch(ctx, batch).Close()
+	err := conn.SendBatch(ctx, batch).Close()
 	if	err != nil {
 		fmt.Printf("Failed to execute batch: %v\n", err)
 		return
@@ -781,7 +638,6 @@ func (e simplePgxBatchExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		rate := float64(totalOps) / duration
 		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
 	}
-	// dumpPreparedStatements(ctx, conn)
 }
 
 func dumpPreparedStatements(ctx context.Context, conn *pgx.Conn) {
