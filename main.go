@@ -275,10 +275,10 @@ func (e tempJsonRecordExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 
 	insertSQL := fmt.Sprintf(`
 	INSERT INTO %[1]s (id, time, name, value) OVERRIDING SYSTEM VALUE
-	SELECT id, time, name, value FROM (
-	SELECT (jsonb_populate_record(NULL::%[1]s, v.payload)).*
-	FROM cdc_stagging AS v
-	WHERE v.op = 'I');
+	SELECT p.id, p.time, p.name, p.value FROM cdc_stagging AS v
+	CROSS JOIN LATERAL
+  jsonb_populate_record(NULL::%[1]s, v.payload)      AS p
+	WHERE v.op = 'I';
 	`,cfg.relName(),
 	)
 
