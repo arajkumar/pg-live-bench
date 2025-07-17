@@ -92,6 +92,8 @@ func main() {
 		exec = tempTableExecutor{cfg: cfg}
 	case "temp_json":
 		exec = tempJsonExecutor{cfg: cfg}
+	case "temp_json_record":
+		exec = tempJsonRecordExecutor{cfg: cfg}
 	default:
 		panic(fmt.Sprintf("Unknown mode: %s", cfg.mode))
 	}
@@ -178,6 +180,144 @@ func (c config) updateRecords(
 	}
 	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
 	return updates
+}
+
+type tempJsonRecordExecutor struct {
+	cfg config
+}
+
+func (e tempJsonRecordExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
+
+	batch := &pgx.Batch{}
+
+	batch.Queue(
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
+	)
+
+	totalOps, numInserts, numUpdates := cfg.ops()
+
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
+
+	// Create a temporary table for the batch
+	tempTableDDL := `
+		CREATE TEMP TABLE IF NOT EXISTS cdc_stagging (
+			id bigserial, -- this should be the primary key for operation ordering
+			dest_table NAME,
+			op varchar(1),
+			payload jsonb,
+			where_clause jsonb
+		);
+		TRUNCATE TABLE cdc_stagging;
+		-- CREATE INDEX IF NOT EXISTS cdc_stagging_op_idx ON cdc_stagging (op);
+		`
+
+	_, err := conn.Exec(ctx, tempTableDDL)
+	if err != nil {
+		fmt.Printf("Failed to create temporary table: %v\n", err)
+		return
+	}
+
+
+	// account copy time as well
+	start := time.Now()
+
+	rowsInserted := 0
+	copyFromFunc := func() (row []any, err error) {
+		if rowsInserted >= numInserts {
+			return nil, nil
+		}
+		rowsInserted++
+		return []any{
+			cfg.relName(), // dest_table
+			"I", // op
+			map[string]any{
+				"id":    rand.Intn(10000),
+				"time":  time.Now(),
+				"name":  fmt.Sprintf("metric_%d", rand.Intn(1000)),
+				"value":  rand.Float64() * 100,
+			}, // payload
+		}, nil
+	}
+
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{"cdc_stagging"}, []string{"dest_table", "op", "payload"}, pgx.CopyFromFunc(copyFromFunc))
+	if err != nil {
+		fmt.Printf("Failed to copy data into temporary table: %v\n", err)
+		return
+	}
+
+
+	rowsUpdated := 0
+	copyFromUpdateFunc := func() (row []any, err error) {
+		if rowsUpdated >= len(updates) {
+			return nil, nil
+		}
+		rowsUpdated++
+		return []any {
+			cfg.relName(), // dest_table
+			"U", // op
+			map[string]any{
+				"value": rand.Float64() * 100000, // Random value for update
+			}, // payload
+			map[string]any{
+				"time":  updates[rowsUpdated - 1].Time,
+				"seq_id": updates[rowsUpdated - 1].SeqID,
+			},
+		}, nil
+	}
+
+	_, err = conn.CopyFrom(ctx, pgx.Identifier{"cdc_stagging"}, []string{"dest_table", "op", "payload", "where_clause"}, pgx.CopyFromFunc(copyFromUpdateFunc))
+	if err != nil {
+		fmt.Printf("Failed to copy data for updates into temporary table: %v\n", err)
+		return
+	}
+
+
+	insertSQL := fmt.Sprintf(`
+	INSERT INTO %[1]s (id, time, name, value) OVERRIDING SYSTEM VALUE
+	SELECT id, time, name, value FROM (
+	SELECT (jsonb_populate_record(NULL::%[1]s, v.payload)).*
+	FROM cdc_stagging AS v
+	WHERE v.op = 'I');
+	`,cfg.relName(),
+	)
+
+	batch.Queue(
+		insertSQL,
+	)
+
+	// updates
+	updateSQL := fmt.Sprintf(`
+	UPDATE %[1]s AS t
+SET value = p.value
+FROM cdc_stagging AS v
+CROSS JOIN LATERAL
+  jsonb_populate_record(NULL::%[1]s, v.payload)      AS p
+CROSS JOIN LATERAL
+  jsonb_populate_record(NULL::%[1]s, v.where_clause) AS w
+WHERE v.op = 'U'
+  AND t.seq_id   = w.seq_id
+  AND t.time = w.time;
+	`,
+		cfg.relName(),
+	)
+
+	batch.Queue(
+		updateSQL,
+	)
+
+
+	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
+	err = conn.SendBatch(ctx, batch).Close()
+	if	err != nil {
+		fmt.Printf("Failed to execute batch: %v\n", err)
+		return
+	}
+	duration := time.Since(start).Seconds()
+	if duration > 0 {
+		rate := float64(totalOps) / duration
+		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
+	}
 }
 
 type tempJsonExecutor struct {
