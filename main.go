@@ -94,6 +94,8 @@ func main() {
 		exec = tempJsonExecutor{cfg: cfg}
 	case "temp_json_record":
 		exec = tempJsonRecordExecutor{cfg: cfg}
+	case "in_mem_json_record":
+		exec = inMemJsonRecordExecutor{cfg: cfg}
 	default:
 		panic(fmt.Sprintf("Unknown mode: %s", cfg.mode))
 	}
@@ -180,6 +182,80 @@ func (c config) updateRecords(
 	}
 	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
 	return updates
+}
+
+type inMemJsonRecordExecutor struct {
+	cfg config
+}
+
+func (e inMemJsonRecordExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
+
+	batch := &pgx.Batch{}
+
+	batch.Queue(
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
+	)
+
+	totalOps, numInserts, numUpdates := cfg.ops()
+
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
+
+	start := time.Now()
+
+	insertSQL := fmt.Sprintf(`
+		INSERT INTO %[1]s (id, time, name, value)
+		SELECT p.id, p.time, p.name, p.value
+		FROM jsonb_populate_recordset(NULL::%[1]s, $1::jsonb) AS p
+		`, cfg.relName(),
+	)
+
+	ins := make([]map[string]any, numInserts)
+	for i := 0; i < numInserts; i++ {
+		ins[i] = map[string]any{
+			"id":    rand.Intn(10000),
+			"time":  time.Now(),
+			"name":  fmt.Sprintf("metric_%d", rand.Intn(1000)),
+			"value": rand.Float64() * 100,
+		}
+	}
+
+	batch.Queue(
+		insertSQL,
+		ins,
+	)
+
+	updateSQL := fmt.Sprintf(`
+		UPDATE %[1]s AS t
+		SET value = p.value
+		FROM jsonb_populate_recordset(NULL::%[1]s, $1::jsonb) AS p
+		WHERE t.seq_id = p.seq_id AND t.time = p.time
+		`, cfg.relName(),
+	)
+	upd := make([]map[string]any, len(updates))
+	for i, u := range updates {
+		upd[i] = map[string]any{
+			"value": rand.Float64() * 100000, // Random value for update
+			"time":  u.Time, // Use the time from the update info
+			"seq_id": u.SeqID, // Use the max seq_id from the update info
+		}
+	}
+	batch.Queue(
+		updateSQL,
+		upd,
+	)
+
+	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
+	err := conn.SendBatch(ctx, batch).Close()
+	if	err != nil {
+		fmt.Printf("Failed to execute batch: %v\n", err)
+		return
+	}
+	duration := time.Since(start).Seconds()
+	if duration > 0 {
+		rate := float64(totalOps) / duration
+		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n",numInserts, numUpdates, duration, rate)
+	}
 }
 
 type tempJsonRecordExecutor struct {
