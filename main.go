@@ -14,7 +14,7 @@ import (
 )
 
 var (
-	totalRecords = 10000
+	totalRecords = 10000.0
 )
 
 type config struct {
@@ -22,7 +22,7 @@ type config struct {
 	dbURL        string
 	tableName    string
 	schemaName  string
-	scale         int
+	scale         float64
 	planCacheMode string
 	minUpdatePct float64
 	maxUpdatePct float64
@@ -39,7 +39,7 @@ func main() {
 	flag.StringVar(&cfg.dbURL, "db", "", "PostgreSQL connection URL")
 	flag.StringVar(&cfg.schemaName, "schema", "public", "Schema name to use for the benchmark")
 	flag.StringVar(&cfg.tableName, "table", "metrics", "Table name to use for the benchmark")
-	flag.IntVar(&cfg.scale, "scale", 1, "Scale factor for the number of records (default is 1x, 10000 records)")
+	flag.Float64Var(&cfg.scale, "scale", 1.0, "Scale factor for the number of records (default is 1x, 10000 records)")
 	flag.StringVar(&cfg.planCacheMode, "plan_cache_mode", "auto", "Plan cache mode to use for the connection")
 	flag.Float64Var(&cfg.minUpdatePct, "min_update_pct", 0.1, "Minimum percentage of updates in the batch (default is 0.1)")
 	flag.Float64Var(&cfg.maxUpdatePct, "max_update_pct", 0.3, "Maximum percentage of updates in the batch (default is 0.3)")
@@ -136,7 +136,7 @@ func (c config) ops() (totalOps, numInserts, numUpdates int) {
 	totalRecords := c.scale * totalRecords
 
 	numUpdates = int(float64(totalRecords) * updatePct)
-	numInserts = totalRecords - numUpdates
+	numInserts = int(totalRecords) - numUpdates
 
 	totalOps = numInserts + numUpdates
 	return totalOps, numInserts, numUpdates
