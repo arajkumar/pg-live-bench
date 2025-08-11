@@ -664,6 +664,8 @@ func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
 	)
 
+	start := time.Now()
+
 	insertSQL := fmt.Sprintf(
 		`INSERT INTO %s (id, time, name, value)
 		SELECT id, time, name, value FROM unnest(
@@ -695,7 +697,8 @@ func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 	)
 
 	// updates
-	updateSQL := `UPDATE %[1]s AS t SET value = v.value::numeric
+	updateSQL := `
+		UPDATE %[1]s AS t SET value = v.value
 		FROM (
 			SELECT value, time, seq_id FROM unnest(
 				$1::numeric[],
@@ -721,8 +724,6 @@ func (e unnestExecutor) execute(ctx context.Context, conn *pgx.Conn) {
 		fmt.Sprintf(updateSQL, cfg.relName()),
 		params...,
 	)
-
-	start := time.Now()
 
 	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n", numInserts, len(updates), time.Now().Format(time.RFC3339))
 	err := conn.SendBatch(ctx, batch).Close()
