@@ -27,6 +27,7 @@ type config struct {
 	minUpdatePct float64
 	maxUpdatePct float64
 	mode          string
+	truncateTable bool
 }
 
 type executor interface {
@@ -44,6 +45,7 @@ func main() {
 	flag.Float64Var(&cfg.minUpdatePct, "min_update_pct", 0.1, "Minimum percentage of updates in the batch (default is 0.1)")
 	flag.Float64Var(&cfg.maxUpdatePct, "max_update_pct", 0.3, "Maximum percentage of updates in the batch (default is 0.3)")
 	flag.StringVar(&cfg.mode, "mode", "multi_value", "Execution mode: 'multi_value' or 'simple_pgx_batch'")
+	flag.BoolVar(&cfg.truncateTable, "truncate", false, "Truncate the target table before starting the benchmark")
 
 	flag.Parse()
 
@@ -64,6 +66,14 @@ func main() {
 		panic(fmt.Sprintf("Failed to connect: %v", err))
 	}
 	defer conn.Close(ctx) //
+
+	if cfg.truncateTable {
+		fmt.Println("Truncating table", cfg.tableName)
+		_, err := conn.Exec(ctx, fmt.Sprintf("TRUNCATE TABLE %s", pgx.Identifier{cfg.schemaName, cfg.tableName}.Sanitize()))
+		if err != nil {
+			panic(fmt.Sprintf("Failed to truncate table: %v", err))
+		}
+	}
 
 	createTable(ctx, conn, cfg)
 
