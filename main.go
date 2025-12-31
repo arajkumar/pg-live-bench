@@ -96,6 +96,8 @@ func main() {
 		exec = tempJsonRecordExecutor{cfg: cfg}
 	case "in_mem_json_record":
 		exec = inMemJsonRecordExecutor{cfg: cfg}
+	case "unnest_composite":
+		exec = unnestCompositeExecutor{cfg: cfg}
 	default:
 		panic(fmt.Sprintf("Unknown mode: %s", cfg.mode))
 	}
@@ -130,6 +132,19 @@ func createTable(ctx context.Context, conn *pgx.Conn, cfg config) {
 	if err != nil {
 		panic(fmt.Sprintf("Failed to create table: %v", err))
 	}
+}
+
+func registerCompositeTypes(ctx context.Context, conn *pgx.Conn, cfg config) error {
+	// Load table's row type and array type
+	// PostgreSQL auto-creates a composite type for each table
+	types, err := conn.LoadTypes(ctx, []string{cfg.tableName, "_" + cfg.tableName})
+	if err != nil {
+		return fmt.Errorf("failed to load types: %w", err)
+	}
+
+	// Register both types in the connection's type map
+	conn.TypeMap().RegisterTypes(types)
+	return nil
 }
 
 func (c config) ops() (totalOps, numInserts, numUpdates int) {
@@ -182,6 +197,110 @@ func (c config) updateRecords(
 	}
 	fmt.Printf("Collected %d for update in %v\n", len(updates), time.Since(queryUpdateTime))
 	return updates
+}
+
+type unnestCompositeExecutor struct {
+	cfg config
+}
+
+// metricsRow matches the FULL table structure including seq_id for composite type encoding
+type metricsRow struct {
+	ID    int32     `db:"id"`
+	Time  time.Time `db:"time"`
+	Name  string    `db:"name"`
+	Value float64   `db:"value"`
+	SeqID int64     `db:"seq_id"` // Must be included to match table composite type
+}
+
+func (e unnestCompositeExecutor) execute(ctx context.Context, conn *pgx.Conn) {
+	cfg := e.cfg
+
+	batch := &pgx.Batch{}
+
+	totalOps, numInserts, numUpdates := cfg.ops()
+
+	updates := cfg.updateRecords(ctx, conn, numUpdates)
+
+	// Register types once per execution
+	// (Safe to call repeatedly - pgx caches registered types)
+	if err := registerCompositeTypes(ctx, conn, cfg); err != nil {
+		fmt.Printf("Failed to register composite types: %v\n", err)
+		return
+	}
+
+	batch.Queue(
+		fmt.Sprintf("SET plan_cache_mode = '%s'", cfg.planCacheMode),
+	)
+
+	start := time.Now()
+
+	// === INSERT LOGIC ===
+	// SQL: Use table name as composite type, select columns directly
+	// Note: OVERRIDING SYSTEM VALUE allows us to insert seq_id=0 and let DB generate it
+	insertSQL := fmt.Sprintf(`
+		INSERT INTO %[1]s (id, time, name, value) OVERRIDING SYSTEM VALUE
+		SELECT id, time, name, value
+		FROM UNNEST($1::%[1]s[])
+	`, cfg.relName())
+
+	// Build rows using struct that matches full table definition
+	rows := make([]metricsRow, numInserts)
+	for i := 0; i < numInserts; i++ {
+		rows[i] = metricsRow{
+			ID:    int32(rand.Intn(10000)),
+			Time:  time.Now(),
+			Name:  fmt.Sprintf("metric_%d", rand.Intn(1000)),
+			Value: rand.Float64() * 100,
+			SeqID: 0, // Will be overridden by database
+		}
+	}
+
+	batch.Queue(insertSQL, rows)
+
+	// === UPDATE LOGIC ===
+	// For updates, we can't use table composite directly (wrong field count)
+	// Fall back to unnest with typed arrays (same as unnestExecutor)
+	updateSQL := fmt.Sprintf(`
+		UPDATE %[1]s AS t SET value = v.value
+		FROM (
+			SELECT value, time, seq_id FROM unnest(
+				$1::numeric[],
+				$2::timestamptz[],
+				$3::bigint[]
+			) AS t(value, time, seq_id)
+		) AS v
+		WHERE t.time = v.time AND t.seq_id = v.seq_id
+	`, cfg.relName())
+
+	values := make([][]any, 3)
+	params := make([]any, 3)
+	for i := range values {
+		values[i] = make([]any, len(updates))
+		params[i] = values[i]
+	}
+	for i, u := range updates {
+		values[0][i] = rand.Float64() * 100000 // value
+		values[1][i] = u.Time                  // time
+		values[2][i] = u.SeqID                 // seq_id
+	}
+
+	batch.Queue(updateSQL, params...)
+
+	// === EXECUTE AND REPORT ===
+	fmt.Printf("Queued batch with %d inserts and %d updates at %s\n",
+		numInserts, len(updates), time.Now().Format(time.RFC3339))
+
+	err := conn.SendBatch(ctx, batch).Close()
+	if err != nil {
+		fmt.Printf("Failed to execute batch: %v\n", err)
+		return
+	}
+
+	duration := time.Since(start).Seconds()
+	if duration > 0 {
+		rate := float64(totalOps) / duration
+		fmt.Printf("Executed %d inserts and %d updates in %.2f seconds (%.2f records/sec)\n", numInserts, numUpdates, duration, rate)
+	}
 }
 
 type inMemJsonRecordExecutor struct {
