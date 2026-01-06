@@ -10,10 +10,8 @@ import (
 	"flag"
 )
 
-/*
-# Create table before executing
-
-CREATE TABLE public.load (
+const tableSchema = `
+CREATE TABLE IF NOT EXISTS public.load (
 	id       bigserial PRIMARY KEY,
 	time     integer NOT NULL,
 	device   double precision,
@@ -25,10 +23,9 @@ CREATE TABLE public.load (
 	device7  text,
 	device8  text,
 	device9  text
-);
+)
+`
 
-
-*/
 
 func main() {
 	var (
@@ -51,6 +48,10 @@ func insertRecordsSecond(connString string, targetSize, batchSize int) {
 		log.Fatal(err)
 	}
 	defer pool.Close()
+	_, err = pool.Exec(context.Background(), tableSchema)
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	for {
 		start := time.Now()
