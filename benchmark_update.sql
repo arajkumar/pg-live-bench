@@ -10,6 +10,22 @@
 \pset pager off
 
 -- ============================================================================
+-- 0. SETUP: Source data (realistic time-series: 50 sensors, slowly changing values)
+-- ============================================================================
+
+DROP TABLE IF EXISTS _source_data;
+
+CREATE TEMP TABLE _source_data AS
+SELECT
+    (g - 1) % 50                               AS id,
+    '2025-01-01'::timestamptz
+        + ((g - 1) / 5000) * INTERVAL '1 day'
+        + ((g - 1) % 5000) * INTERVAL '1 second' AS time,
+    'sensor_' || ((g - 1) % 50)                AS name,
+    (50 + 10 * sin(g::float / 1000) + ((g - 1) % 50) * 0.5)::int::float8 AS value
+FROM generate_series(1, 1000000) g;
+
+-- ============================================================================
 -- 1. SETUP: Hypertable
 -- ============================================================================
 
@@ -19,25 +35,65 @@ CREATE TABLE metrics_ts (
     id    int          NOT NULL,
     time  timestamptz  NOT NULL,
     name  text         NOT NULL,
-    value float8       NOT NULL
+    value float8       NOT NULL,
+    PRIMARY KEY (id, time)
 );
 
 SELECT create_hypertable('metrics_ts', by_range('time', INTERVAL '1 day'));
 
-INSERT INTO metrics_ts (id, time, name, value)
-SELECT
-    g,
-    '2025-01-01'::timestamptz + ((g - 1) / 5000) * INTERVAL '1 day'
-                               + ((g - 1) % 5000) * INTERVAL '1 second',
-    'sensor_' || (g % 500),
-    random() * 100
-FROM generate_series(1, 1000000) g;
+INSERT INTO metrics_ts SELECT * FROM _source_data;
 
 SELECT count(*) AS ts_chunks
 FROM timescaledb_information.chunks
 WHERE hypertable_name = 'metrics_ts';
 
 ANALYZE metrics_ts;
+
+-- ============================================================================
+-- 1b. SETUP: Compressed Hypertable
+-- ============================================================================
+
+DROP TABLE IF EXISTS metrics_ts_comp CASCADE;
+
+CREATE TABLE metrics_ts_comp (
+    id    int          NOT NULL,
+    time  timestamptz  NOT NULL,
+    name  text         NOT NULL,
+    value float8       NOT NULL,
+    PRIMARY KEY (id, time)
+);
+
+SELECT create_hypertable('metrics_ts_comp', by_range('time', INTERVAL '1 day'));
+
+INSERT INTO metrics_ts_comp SELECT * FROM _source_data;
+
+SELECT count(*) AS ts_comp_chunks
+FROM timescaledb_information.chunks
+WHERE hypertable_name = 'metrics_ts_comp';
+
+ANALYZE metrics_ts_comp;
+
+ALTER TABLE metrics_ts_comp SET (
+    timescaledb.compress,
+    timescaledb.compress_segmentby = 'id',
+    timescaledb.compress_orderby = 'time'
+);
+
+SELECT compress_chunk(c.chunk_schema || '.' || c.chunk_name)
+FROM timescaledb_information.chunks c
+WHERE c.hypertable_name = 'metrics_ts_comp'
+  AND c.range_start < '2025-07-15'::timestamptz
+ORDER BY c.range_start;
+
+SELECT count(*) AS compressed_chunks
+FROM timescaledb_information.chunks
+WHERE hypertable_name = 'metrics_ts_comp'
+  AND is_compressed = true;
+
+SELECT count(*) AS uncompressed_chunks
+FROM timescaledb_information.chunks
+WHERE hypertable_name = 'metrics_ts_comp'
+  AND is_compressed = false;
 
 -- ============================================================================
 -- 2. SETUP: Logical Partition
@@ -49,7 +105,8 @@ CREATE TABLE metrics_pg (
     id    int          NOT NULL,
     time  timestamptz  NOT NULL,
     name  text         NOT NULL,
-    value float8       NOT NULL
+    value float8       NOT NULL,
+    PRIMARY KEY (id, time)
 ) PARTITION BY RANGE (time);
 
 DO $$
@@ -75,14 +132,14 @@ CREATE TABLE metrics_plain (
     id    int          NOT NULL,
     time  timestamptz  NOT NULL,
     name  text         NOT NULL,
-    value float8       NOT NULL
+    value float8       NOT NULL,
+    PRIMARY KEY (id, time)
 );
-
-CREATE INDEX ON metrics_plain (time);
-CREATE INDEX ON metrics_plain (id);
 
 INSERT INTO metrics_plain SELECT * FROM metrics_ts;
 ANALYZE metrics_plain;
+
+DROP TABLE _source_data;
 
 -- ============================================================================
 -- 4. Build payload (50 rows spread across last 5 partitions)
@@ -90,14 +147,14 @@ ANALYZE metrics_plain;
 
 SELECT jsonb_agg(
     jsonb_build_object(
-        'where', jsonb_build_object('time', time::text),
+        'where', jsonb_build_object('id', id, 'time', time::text),
         'set',   jsonb_build_object('value', 99.9, 'name', 'updated')
     )
 )::text AS p
 FROM (
-    SELECT m.time FROM generate_series(0, 4) d
+    SELECT m.id, m.time FROM generate_series(0, 4) d
     CROSS JOIN LATERAL (
-        SELECT time FROM metrics_ts
+        SELECT id, time FROM metrics_ts
         WHERE time >= '2025-07-15'::timestamptz + d * INTERVAL '1 day'
           AND time <  '2025-07-15'::timestamptz + (d + 1) * INTERVAL '1 day'
         ORDER BY time LIMIT 10
@@ -128,12 +185,12 @@ FROM (
 
 SELECT jsonb_agg(
     jsonb_build_object(
-        'where', jsonb_build_object('time', time::text),
+        'where', jsonb_build_object('id', id, 'time', time::text),
         'set',   jsonb_build_object('value', 99.9, 'name', 'updated')
     )
 )::text AS p1
 FROM (
-    SELECT time FROM metrics_ts
+    SELECT id, time FROM metrics_ts
     WHERE time >= '2025-07-19'::timestamptz
       AND time <  '2025-07-20'::timestamptz
     ORDER BY time LIMIT 50
@@ -158,7 +215,7 @@ FROM (
 -- 4c. Build payload (single row from last chunk)
 -- ============================================================================
 
-SELECT time::text AS single_time
+SELECT id::text AS single_id, time::text AS single_time
 FROM metrics_ts
 WHERE time >= '2025-07-19'::timestamptz
   AND time <  '2025-07-20'::timestamptz
@@ -167,11 +224,11 @@ ORDER BY time LIMIT 1
 
 SELECT jsonb_build_array(
     jsonb_build_object(
-        'where', jsonb_build_object('time', single_time),
+        'where', jsonb_build_object('id', single_id::int, 'time', single_time),
         'set',   jsonb_build_object('value', 99.9, 'name', 'updated')
     )
 )::text AS p_single
-FROM (SELECT :'single_time' AS single_time) x
+FROM (SELECT :'single_id' AS single_id, :'single_time' AS single_time) x
 \gset
 
 SELECT ('{' || :'single_time' || '}')::text AS t_single
@@ -188,54 +245,71 @@ SELECT ('{' || :'single_time' || '}')::text AS t_single
 
 PREPARE up_ts AS
 UPDATE metrics_ts AS t
-SET value = (cdc->'set'->>'value')::float8, name = cdc->'set'->>'name'
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
 FROM jsonb_array_elements($1) AS cdc
 CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_ts, cdc->'where') AS wc
-WHERE t.time = wc.time AND t.time = ANY($2::timestamptz[]);
+WHERE t.id = wc.id AND t.time = wc.time AND t.time = ANY($2::timestamptz[]);
+
+PREPARE up_ts_comp AS
+UPDATE metrics_ts_comp AS t
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
+FROM jsonb_array_elements($1) AS cdc
+CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_ts_comp, cdc->'where') AS wc
+WHERE t.id = wc.id AND t.time = wc.time AND t.time = ANY($2::timestamptz[]);
+
+PREPARE up_ts_comp_no_any AS
+UPDATE metrics_ts_comp AS t
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
+FROM jsonb_array_elements($1) AS cdc
+CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_ts_comp, cdc->'where') AS wc
+WHERE t.id = wc.id AND t.time = wc.time;
+
+PREPARE up_ts_comp_single AS
+UPDATE metrics_ts_comp SET value = 99.9, name = 'updated' WHERE id = $1::int AND time = $2::timestamptz;
 
 PREPARE up_ts_no_any AS
 UPDATE metrics_ts AS t
-SET value = (cdc->'set'->>'value')::float8, name = cdc->'set'->>'name'
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
 FROM jsonb_array_elements($1) AS cdc
 CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_ts, cdc->'where') AS wc
-WHERE t.time = wc.time;
+WHERE t.id = wc.id AND t.time = wc.time;
 
 PREPARE up_pg AS
 UPDATE metrics_pg AS t
-SET value = (cdc->'set'->>'value')::float8, name = cdc->'set'->>'name'
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
 FROM jsonb_array_elements($1) AS cdc
 CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_pg, cdc->'where') AS wc
-WHERE t.time = wc.time AND t.time = ANY($2::timestamptz[]);
+WHERE t.id = wc.id AND t.time = wc.time AND t.time = ANY($2::timestamptz[]);
 
 PREPARE up_pg_no_any AS
 UPDATE metrics_pg AS t
-SET value = (cdc->'set'->>'value')::float8, name = cdc->'set'->>'name'
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
 FROM jsonb_array_elements($1) AS cdc
 CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_pg, cdc->'where') AS wc
-WHERE t.time = wc.time;
+WHERE t.id = wc.id AND t.time = wc.time;
 
 PREPARE up_plain AS
 UPDATE metrics_plain AS t
-SET value = (cdc->'set'->>'value')::float8, name = cdc->'set'->>'name'
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
 FROM jsonb_array_elements($1) AS cdc
 CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_plain, cdc->'where') AS wc
-WHERE t.time = wc.time AND t.time = ANY($2::timestamptz[]);
+WHERE t.id = wc.id AND t.time = wc.time AND t.time = ANY($2::timestamptz[]);
 
 PREPARE up_plain_no_any AS
 UPDATE metrics_plain AS t
-SET value = (cdc->'set'->>'value')::float8, name = cdc->'set'->>'name'
+SET (value, name) = (SELECT p.value, p.name FROM jsonb_populate_record(t, cdc->'set') AS p)
 FROM jsonb_array_elements($1) AS cdc
 CROSS JOIN LATERAL jsonb_populate_record(NULL::metrics_plain, cdc->'where') AS wc
-WHERE t.time = wc.time;
+WHERE t.id = wc.id AND t.time = wc.time;
 
 PREPARE up_ts_single AS
-UPDATE metrics_ts SET value = 99.9, name = 'updated' WHERE time = $1::timestamptz;
+UPDATE metrics_ts SET value = 99.9, name = 'updated' WHERE id = $1::int AND time = $2::timestamptz;
 
 PREPARE up_pg_single AS
-UPDATE metrics_pg SET value = 99.9, name = 'updated' WHERE time = $1::timestamptz;
+UPDATE metrics_pg SET value = 99.9, name = 'updated' WHERE id = $1::int AND time = $2::timestamptz;
 
 PREPARE up_plain_single AS
-UPDATE metrics_plain SET value = 99.9, name = 'updated' WHERE time = $1::timestamptz;
+UPDATE metrics_plain SET value = 99.9, name = 'updated' WHERE id = $1::int AND time = $2::timestamptz;
 
 SET plan_cache_mode = 'force_custom_plan';
 
@@ -252,6 +326,26 @@ BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::ti
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
 \echo '--- run 3 ---'
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+
+\echo ''
+\echo '=== 1b. Compressed Hypertable + ANY (chunk pruning) ==='
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+\echo '--- run 1 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+\echo '--- run 2 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+\echo '--- run 3 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+
+\echo ''
+\echo '=== 1c. Compressed Hypertable NO ANY (all chunks scanned) ==='
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
+\echo '--- run 1 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
+\echo '--- run 2 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
+\echo '--- run 3 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
 
 \echo ''
 \echo '=== 2. Hypertable NO ANY (all chunks scanned) ==='
@@ -318,6 +412,16 @@ BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p1'::jsonb, :'t1'::
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
 
 \echo ''
+\echo '=== 6a2. Compressed Hypertable + ANY (single chunk) ==='
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+\echo '--- run 1 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+\echo '--- run 2 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+\echo '--- run 3 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+
+\echo ''
 \echo '=== 6b. Logical Partition + ANY (single partition) ==='
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
 \echo '--- run 1 ---'
@@ -352,6 +456,16 @@ BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p_single'::jsonb, :
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
 
 \echo ''
+\echo '=== 6d2. Compressed Hypertable batch 1-row + ANY (single chunk) ==='
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+\echo '--- run 1 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+\echo '--- run 2 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+\echo '--- run 3 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+
+\echo ''
 \echo '=== 6e. Logical Partition batch 1-row + ANY (single partition) ==='
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
 \echo '--- run 1 ---'
@@ -377,33 +491,43 @@ BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p_single'::jsonb
 
 \echo ''
 \echo '=== 6g. Hypertable single-row UPDATE ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
+
+\echo ''
+\echo '=== 6g2. Compressed Hypertable single-row UPDATE ==='
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
+\echo '--- run 1 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
+\echo '--- run 2 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
+\echo '--- run 3 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
 
 \echo ''
 \echo '=== 6h. Logical Partition single-row UPDATE ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
 
 \echo ''
 \echo '=== 6i. Plain Table single-row UPDATE ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
 \echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_time'); ROLLBACK;
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
 
 -- ============================================================================
 -- 7. GENERIC PLAN tests
@@ -420,6 +544,16 @@ BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::ti
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
 \echo '--- run 3 ---'
 BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+
+\echo ''
+\echo '=== 7b. GENERIC PLAN: Compressed Hypertable + ANY ==='
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+\echo '--- run 1 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+\echo '--- run 2 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+\echo '--- run 3 ---'
+BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
 
 \echo ''
 \echo '=== 8. GENERIC PLAN: Logical Partition + ANY ==='
