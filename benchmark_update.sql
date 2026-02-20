@@ -3,11 +3,23 @@
 -- Table: metrics(id int, time timestamptz, name text, value float8)
 -- Partition key: time (timestamptz), 200 chunks/partitions, 5000 rows each
 --
--- Usage: psql -f benchmark_update_partitioning.sql
+-- Usage:
+--   psql $TARGET -v plan_cache_mode=force_custom_plan -v warmup=1 -f benchmark_update.sql
+--   psql $TARGET -v plan_cache_mode=force_generic_plan -v warmup=1 -f benchmark_update.sql
+--   psql $TARGET -v plan_cache_mode=auto -v warmup=5 -f benchmark_update.sql
 -- ============================================================================
 
 \timing on
 \pset pager off
+
+\if :{?plan_cache_mode}
+\else
+\set plan_cache_mode force_custom_plan
+\endif
+\if :{?warmup}
+\else
+\set warmup 1
+\endif
 
 -- ============================================================================
 -- 0. SETUP: Source data (realistic time-series: 50 sensors, slowly changing values)
@@ -311,261 +323,138 @@ UPDATE metrics_pg SET value = 99.9, name = 'updated' WHERE id = $1::int AND time
 PREPARE up_plain_single AS
 UPDATE metrics_plain SET value = 99.9, name = 'updated' WHERE id = $1::int AND time = $2::timestamptz;
 
-SET plan_cache_mode = 'force_custom_plan';
-
 -- ============================================================================
--- 6. BENCHMARKS (1 warmup + 3 measured runs each)
+-- 6. run_bench function + plan_cache_mode
 -- ============================================================================
 
-\echo ''
-\echo '=== 1. Hypertable + ANY (chunk pruning) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+CREATE OR REPLACE FUNCTION run_bench(
+  label         text,
+  exec_sql      text,
+  warmup_count  int DEFAULT 1,
+  measured_runs int DEFAULT 3
+) RETURNS SETOF text LANGUAGE plpgsql AS $$
+DECLARE
+  i    int;
+  line text;
+BEGIN
+  RETURN NEXT '';
+  RETURN NEXT format('=== %s ===', label);
+
+  FOR i IN 1..warmup_count LOOP
+    BEGIN
+      EXECUTE exec_sql;
+      RAISE EXCEPTION 'bench_rollback';
+    EXCEPTION WHEN raise_exception THEN END;
+  END LOOP;
+
+  FOR i IN 1..measured_runs LOOP
+    RETURN NEXT format('--- run %s ---', i);
+    BEGIN
+      FOR line IN EXECUTE format('EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) %s', exec_sql) LOOP
+        RETURN NEXT line;
+      END LOOP;
+      RAISE EXCEPTION 'bench_rollback';
+    EXCEPTION WHEN raise_exception THEN END;
+  END LOOP;
+END;
+$$;
+
+SET plan_cache_mode = :'plan_cache_mode';
 
 \echo ''
-\echo '=== 1b. Compressed Hypertable + ANY (chunk pruning) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-
-\echo ''
-\echo '=== 1c. Compressed Hypertable NO ANY (all chunks scanned) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_no_any(:'p'::jsonb); ROLLBACK;
-
-\echo ''
-\echo '=== 2. Hypertable NO ANY (all chunks scanned) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_no_any(:'p'::jsonb); ROLLBACK;
-
-\echo ''
-\echo '=== 3. Logical Partition + ANY (plan-time pruning) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-
-\echo ''
-\echo '=== 4. Logical Partition NO ANY (runtime pruning) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_no_any(:'p'::jsonb); ROLLBACK;
-
-\echo ''
-\echo '=== 5. Plain Table + ANY ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-
-\echo ''
-\echo '=== 6. Plain Table NO ANY (baseline) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_no_any(:'p'::jsonb); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_no_any(:'p'::jsonb); ROLLBACK;
+\echo '============================================================'
+\echo 'plan_cache_mode = ' :plan_cache_mode ', warmup = ' :warmup
+\echo '============================================================'
 
 -- ============================================================================
--- 6b. SINGLE-CHUNK BENCHMARKS (last chunk only, 50 rows)
+-- 7. BENCHMARKS
 -- ============================================================================
 
-\echo ''
-\echo '=== 6a. Hypertable + ANY (single chunk) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('1. HT batch (5 chunks)',
+  format('EXECUTE up_ts(%L::jsonb, %L::timestamptz[])', :'p'::jsonb, :'t'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6a2. Compressed Hypertable + ANY (single chunk) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('1b. Compressed HT batch (5 chunks)',
+  format('EXECUTE up_ts_comp(%L::jsonb, %L::timestamptz[])', :'p'::jsonb, :'t'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6b. Logical Partition + ANY (single partition) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('1c. Compressed HT NO ANY (all chunks)',
+  format('EXECUTE up_ts_comp_no_any(%L::jsonb)', :'p'::jsonb),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6c. Plain Table + ANY (single chunk baseline) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p1'::jsonb, :'t1'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('2. HT NO ANY (all chunks)',
+  format('EXECUTE up_ts_no_any(%L::jsonb)', :'p'::jsonb),
+  :'warmup'::int);
 
--- ============================================================================
--- 6d. BATCH UPDATE — 1 row, single chunk (jsonb batch with 1 element)
--- ============================================================================
+SELECT * FROM run_bench('3. Logical Partition + ANY (5 parts)',
+  format('EXECUTE up_pg(%L::jsonb, %L::timestamptz[])', :'p'::jsonb, :'t'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6d. Hypertable batch 1-row + ANY (single chunk) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('4. Logical Partition NO ANY',
+  format('EXECUTE up_pg_no_any(%L::jsonb)', :'p'::jsonb),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6d2. Compressed Hypertable batch 1-row + ANY (single chunk) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('5. Plain Table + ANY',
+  format('EXECUTE up_plain(%L::jsonb, %L::timestamptz[])', :'p'::jsonb, :'t'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6e. Logical Partition batch 1-row + ANY (single partition) ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('6. Plain Table NO ANY (baseline)',
+  format('EXECUTE up_plain_no_any(%L::jsonb)', :'p'::jsonb),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6f. Plain Table batch 1-row + ANY ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain(:'p_single'::jsonb, :'t_single'::timestamptz[]); ROLLBACK;
+-- Single-chunk benchmarks (last chunk only, 50 rows)
 
--- ============================================================================
--- 6g. SINGLE-ROW UPDATE (no jsonb, plain WHERE time = $1)
--- ============================================================================
+SELECT * FROM run_bench('6a. HT + ANY (single chunk)',
+  format('EXECUTE up_ts(%L::jsonb, %L::timestamptz[])', :'p1'::jsonb, :'t1'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6g. Hypertable single-row UPDATE ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_single(:'single_id', :'single_time'); ROLLBACK;
+SELECT * FROM run_bench('6a2. Compressed HT + ANY (single chunk)',
+  format('EXECUTE up_ts_comp(%L::jsonb, %L::timestamptz[])', :'p1'::jsonb, :'t1'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6g2. Compressed Hypertable single-row UPDATE ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp_single(:'single_id', :'single_time'); ROLLBACK;
+SELECT * FROM run_bench('6b. Logical Partition + ANY (single part)',
+  format('EXECUTE up_pg(%L::jsonb, %L::timestamptz[])', :'p1'::jsonb, :'t1'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6h. Logical Partition single-row UPDATE ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg_single(:'single_id', :'single_time'); ROLLBACK;
+SELECT * FROM run_bench('6c. Plain Table + ANY (single chunk baseline)',
+  format('EXECUTE up_plain(%L::jsonb, %L::timestamptz[])', :'p1'::jsonb, :'t1'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 6i. Plain Table single-row UPDATE ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_plain_single(:'single_id', :'single_time'); ROLLBACK;
+-- Batch 1-row + ANY (single chunk)
 
--- ============================================================================
--- 7. GENERIC PLAN tests
--- ============================================================================
+SELECT * FROM run_bench('6d. HT batch 1-row + ANY (single chunk)',
+  format('EXECUTE up_ts(%L::jsonb, %L::timestamptz[])', :'p_single'::jsonb, :'t_single'::timestamptz[]),
+  :'warmup'::int);
 
-SET plan_cache_mode = 'force_generic_plan';
+SELECT * FROM run_bench('6d2. Compressed HT batch 1-row + ANY (single chunk)',
+  format('EXECUTE up_ts_comp(%L::jsonb, %L::timestamptz[])', :'p_single'::jsonb, :'t_single'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 7. GENERIC PLAN: Hypertable + ANY ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('6e. Logical Partition batch 1-row + ANY (single part)',
+  format('EXECUTE up_pg(%L::jsonb, %L::timestamptz[])', :'p_single'::jsonb, :'t_single'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 7b. GENERIC PLAN: Compressed Hypertable + ANY ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_ts_comp(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+SELECT * FROM run_bench('6f. Plain Table batch 1-row + ANY',
+  format('EXECUTE up_plain(%L::jsonb, %L::timestamptz[])', :'p_single'::jsonb, :'t_single'::timestamptz[]),
+  :'warmup'::int);
 
-\echo ''
-\echo '=== 8. GENERIC PLAN: Logical Partition + ANY ==='
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 1 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 2 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
-\echo '--- run 3 ---'
-BEGIN; EXPLAIN (ANALYZE, BUFFERS, COSTS OFF) EXECUTE up_pg(:'p'::jsonb, :'t'::timestamptz[]); ROLLBACK;
+-- Single-row UPDATE (no jsonb, plain WHERE)
 
-SET plan_cache_mode = 'force_custom_plan';
+SELECT * FROM run_bench('6g. HT single-row UPDATE',
+  format('EXECUTE up_ts_single(%L::int, %L::timestamptz)', :'single_id', :'single_time'),
+  :'warmup'::int);
+
+SELECT * FROM run_bench('6g2. Compressed HT single-row UPDATE',
+  format('EXECUTE up_ts_comp_single(%L::int, %L::timestamptz)', :'single_id', :'single_time'),
+  :'warmup'::int);
+
+SELECT * FROM run_bench('6h. Logical Partition single-row UPDATE',
+  format('EXECUTE up_pg_single(%L::int, %L::timestamptz)', :'single_id', :'single_time'),
+  :'warmup'::int);
+
+SELECT * FROM run_bench('6i. Plain Table single-row UPDATE',
+  format('EXECUTE up_plain_single(%L::int, %L::timestamptz)', :'single_id', :'single_time'),
+  :'warmup'::int);
 
 -- ============================================================================
 -- 8. CLEANUP
